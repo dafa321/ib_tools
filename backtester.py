@@ -1,23 +1,28 @@
+from __future__ import annotations
+
 from datetime import datetime
 from itertools import count
 import pickle
-from collections import namedtuple
-from typing import NamedTuple, List, Any
+from typing import NamedTuple, List, Any, Union, Tuple, Type
 
 import pandas as pd
 import numpy as np
 from logbook import Logger
 
 from ib_insync import IB as master_IB
+from ib_insync import util
 from ib_insync.contract import Future, ContFuture, Contract
 from ib_insync.objects import (BarData, BarDataList, ContractDetails,
                                TradeLogEntry, Position, CommissionReport,
                                Execution, Fill)
-from ib_insync.order import OrderStatus, Trade, MarketOrder
+from ib_insync.order import OrderStatus, Trade, MarketOrder, Order
 from eventkit import Event
 
+from datastore_pytables import Store
+from trader import Manager
 
 log = Logger(__name__)
+util.patchAsyncio()
 
 
 class IB:
@@ -28,15 +33,14 @@ class IB:
 
     ib = master_IB()
 
-    def __init__(self, datasource, cash):
-        self.datasource = datasource
-        self.account = Account(cash)
+    def __init__(self, datasource_manager: DataSourceManager,
+                 ) -> None:
+        self.datasource = datasource_manager.get_history
         self.market = Market()
-        self.market.account = self.account
         self._createEvents()
         self.id = count(1, 1)
 
-    def _createEvents(self):
+    def _createEvents(self) -> None:
         self.barUpdateEvent = Event('barUpdateEvent')
         self.newOrderEvent = Event('newOrderEvent')
         self.orderModifyEvent = Event('orderModifyEvent')
@@ -55,7 +59,6 @@ class IB:
             log.debug(f'{filename} for {repr(obj)} read from file')
             return details
         except KeyError:
-            print(f'attempting to retrieve: {obj}')
             with self.ib.connect(port=4002, clientId=2) as conn:
                 f = getattr(conn, method)
                 if args:
@@ -70,7 +73,7 @@ class IB:
                 pickle.dump(c, f)
             return details
 
-    def reqContractDetails(self, contract):
+    def reqContractDetails(self, contract: Type[Contract]):
         return self.read_from_file_or_ib('details', 'reqContractDetails',
                                          contract)
 
@@ -119,19 +122,18 @@ class IB:
     def reqHistoricalData(self, contract, durationStr, barSizeSetting,
                           *args, **kwargs):
         duration = int(durationStr.split(' ')[0]) * 2
-        source = self.datasource(contract, duration)
-        return source.bars
+        return self.datasource(contract, duration)
 
     def positions(self):
-        return self.account.positions.values()
+        return self.market.account.positions.values()
 
     def accountValues(self):
-        log.info(f'cash: {self.account.cash}')
+        log.info(f'cash: {self.market.account.cash}')
         return [
             AccountValue(tag='TotalCashBalance',
-                         value=self.account.cash),
+                         value=self.market.account.cash),
             AccountValue(tag='UnrealizedPnL',
-                         value=self.account.unrealizedPnL)
+                         value=self.market.account.unrealizedPnL)
         ]
 
     def openTrades(self):
@@ -153,11 +155,13 @@ class IB:
             # this is a new order
             assert order.totalQuantity != 0, 'Order quantity cannot be zero'
             order.orderId = orderId
-            orderStatus = OrderStatus(status=OrderStatus.PendingSubmit)
+            order.permId = orderId
+            orderStatus = OrderStatus(status=OrderStatus.PendingSubmit,
+                                      remaining=order.totalQuantity)
             logEntry = TradeLogEntry(now, orderStatus, '')
             trade = Trade(contract, order, orderStatus, [], [logEntry])
             self.newOrderEvent.emit(trade)
-            self.market.trades.append(trade)
+            self.market.append_trade(trade)
         return trade
 
     def cancelOrder(self, order):
@@ -188,14 +192,39 @@ class IB:
         commissions = self.reqCommissions(self.market.objects.keys())
         self.market.commissions = {cont: comm.commission
                                    for cont, comm in commissions.items()}
-        self.market.ticks = {cont.symbol: self.reqContractDetails(cont)[0].minTick
-                             for cont in self.market.objects.keys()}
+        self.market.ticks = {
+            cont.symbol: self.reqContractDetails(cont)[0].minTick
+            for cont in self.market.objects.keys()}
+        log.debug(f'market.object.keys: {self.market.objects.keys()}')
+        log.debug(f'properties set on Market: {self.market}')
+        log.debug(f'commissions: {self.market.commissions}')
+        log.debug(f'ticks: {self.market.ticks}')
 
-        self.market.run()
+        util.run(self.market.run())
 
     def sleep(self, *args):
         # this makes sense only if run in asyncio
-        pass
+        util.sleep()
+
+
+class DataSourceManager:
+    """
+    Holds initilized DataSource objects. Responds to history requests by
+    providing appropriate source object.
+    """
+
+    def __init__(self, store: Store, start_date: datetime, end_date: datetime):
+        self.sources = {}
+        self.DataSource = DataSource.initialize(store, start_date, end_date)
+
+    def source(self, contract: Type[Contract], duration: int) -> dict:
+        if not self.sources.get(repr(contract)):
+            self.sources[repr(contract)] = self.DataSource(contract, duration)
+        return self.sources[repr(contract)]
+
+    def get_history(self, contract: Type[Contract], duration: int) -> None:
+        return self.source(contract, duration).get_history(
+            Market().date, duration)
 
 
 class DataSource:
@@ -204,21 +233,35 @@ class DataSource:
     end_date = None
     store = None
 
-    def __init__(self, contract, duration):
+    def __init__(self, contract: Type[Contract], duration: int) -> None:
         self.contract = self.validate_contract(contract)
-        df = self.store.read(self.contract,
-                             start_date=self.start_date,
-                             end_date=self.end_date)
-        self.startup_end_point = self.start_date + pd.Timedelta(duration, 'D')
-        # this is data for emissions as df
-        data_df = self.get_data_df(df)
-        # this index will be available for emissions
-        self.index = data_df.index
-        # this is data for emissions as bars list
-        self.data = self.get_dict(data_df)
-        self.bars = self.startup(df)
-        # self.last_bar = None
+        self.duration = duration
+        start_date = self.start_date - pd.Timedelta(duration, 'D')
+        self.pull_data(start_date=start_date)
+        # this is index of data available for emissions
+        self.index = self.df.loc[self.start_date: self.end_date].index
         Market().register(self)
+
+    def pull_data(self, start_date: pd.Datetime = None) -> None:
+        start_date = self.start_date if start_date is None else start_date
+        self.df = self.store.read(self.contract,
+                                  start_date=start_date,
+                                  end_date=self.end_date).sort_index(
+                                      ascending=True)
+
+        # this is data for emissions as bars list
+        self.data = self.get_dict(self.df.loc[self.start_date: self.end_date])
+
+    def get_history(self, end_date: pd.Datetime, duration: int) -> BarDataList:
+        """
+        Convert df into bars list that will be available as history.
+        """
+        start_date = end_date - pd.Timedelta(duration, 'D')
+        if start_date < self.df.index[0]:
+            self.pull_data(start_date)
+        log.debug(f'history data from {start_date} to {end_date}')
+        self.bars = self.get_BarDataList(self.df.loc[start_date: end_date])
+        return self.bars
 
     @classmethod
     def initialize(cls, datastore, start_date, end_date=datetime.now()):
@@ -230,26 +273,6 @@ class DataSource:
             raise(ValueError(message))
         cls.store = datastore
         return cls
-
-    def get_data_df(self, df):
-        """
-        Create bars list that will be available for emissions.
-        Index is sorted: descending (but in current implementation, it doesn't matter)
-        """
-        log.debug(f'startup end point: {self.startup_end_point}')
-        data_df = df.loc[:self.startup_end_point]
-        return data_df
-
-    def startup(self, df):
-        """
-        Create bars list that will be available pre-emissions (startup).
-        Index is sorted: ascending.
-        """
-        log.debug(f'generating startup data for {self.contract.localSymbol}')
-        startup_chunk = df.loc[self.startup_end_point:].sort_index(
-            ascending=True)
-        log.debug(f'startup chunk length: {len(startup_chunk)}')
-        return self.get_BarDataList(startup_chunk)
 
     def validate_contract(self, contract):
         if isinstance(contract, ContFuture):
@@ -285,7 +308,7 @@ class DataSource:
         return f'data source for {self.contract.localSymbol}'
 
     def emit(self, date):
-        bar = self.data.get(date)
+        bar = self.bar(date)
         if bar:
             self.bars.append(bar)
             self.bars.updateEvent.emit(self.bars, True)
@@ -299,7 +322,8 @@ class DataSource:
 
 class Market:
     class __Market:
-        def __init__(self):
+        def __init__(self, reboot=False):
+            self._reboot = reboot
             self.objects = {}
             self.prices = {}
             self.trades = []
@@ -307,58 +331,130 @@ class Market:
             self.date = None
             self.exec_id = count(1, 1)
 
-        def get_trade(self, order):
+        def get_trade(self, order: Order) -> Union[Trade, None]:
             for trade in self.trades:
                 if trade.order == order:
                     return trade
 
-        def register(self, source):
+        def register(self, source: DataSource) -> None:
             if self.index is None:
                 self.index = source.index
             else:
                 self.index.join(source.index, how='outer')
-            self.objects[source.contract] = source
-            log.debug(f'object {source} registered with Market')
-
-        def run(self):
             self.index = self.index.sort_values()
-            log.info(
-                f'index duplicates: {self.index[self.index.duplicated()]}')
+            duplicates = self.index[self.index.duplicated()]
+            if len(duplicates) != 0:
+                log.error(f'index duplicates: {duplicates}')
+            self.date = self.index[0]
+            self.objects[source.contract] = source
+
+        def date_generator(self):
+            for date in self.index:
+                yield(date)
+
+        async def run(self) -> None:
+            # has to be coroutine to allow Trader to release control
+            log.debug(f'Market initialized with reboot={self._reboot}')
+            log.debug(f'Market object: {self}')
             log.debug(f'commision levels for instruments: {self.commissions}')
             log.debug(f'minTicks for instruments: {self.ticks}')
-            for date in self.index:
-                log.debug(f'current date: {date}')
-                self.date = date
+            try:
+                getattr(self, 'manager')
+            except AttributeError:
+                raise AttributeError(
+                    'No manager object provided to the Market')
+            date = self.date_generator()
+            day = None
+
+            while True:
+                try:
+                    self.date = next(date)
+                except StopIteration:
+                    return
+                if self.date is None:
+                    break
+                if day:
+                    if self.date.day != day and self._reboot:
+                        self.reboot()
+                        day = None
+                else:
+                    day = self.date.day
+                log.debug(f'current date: {self.date}')
                 for o in self.objects.values():
-                    o.emit(date)
+                    o.emit(self.date)
                 self.extract_prices()
                 self.account.mark_to_market(self.prices)
                 self.run_orders()
 
-        def extract_prices(self):
+        def reboot(self):
+            # pending events must be cancelled on reboot to mimick real app
+            for trade in self.trades:
+                for event in trade.events:
+                    getattr(trade, event).clear()
+            self.manager.onConnected()
+
+        def append_trade(self, trade: Trade) -> None:
+            if trade.order.orderType == 'TRAIL':
+                trade = self.set_trail_price(trade)
+            self.trades.append(trade)
+
+        def set_trail_price(self, trade: Trade) -> Trade:
+            position = self.account.positions.get(trade.contract)
+            if position:
+                avgCost = position.avgCost
+                if isinstance(trade.contract, (Future, ContFuture)):
+                    price = avgCost / int(trade.contract.multiplier)
+                else:
+                    price = avgCost
+            else:
+                log.warning(f'trail order without corresponding position')
+                price = self.prices[trade.contract.symbol].open
+
+            if trade.order.action.upper() == 'BUY':
+                trade.order.trailStopPrice = price + trade.order.auxPrice
+            else:
+                trade.order.trailStopPrice = price - trade.order.auxPrice
+            log.debug(
+                f'initial trail price set at {trade.order.trailStopPrice}')
+            return trade
+
+        def extract_prices(self) -> None:
             for contract, bars in self.objects.items():
                 if bars.bar(self.date) is not None:
-                    self.prices[contract.symbol] = bars.bar(self.date).average
+                    self.prices[contract.symbol] = bars.bar(self.date)
 
-        def run_orders(self):
+        def run_orders(self) -> None:
             open_trades = [
                 trade for trade in self.trades if not trade.isDone()]
             for trade in open_trades.copy():
-                if self.validate_order(trade.order,
-                                       self.prices[trade.contract.symbol]):
-                    self.execute_trade(trade)
+                price_or_bool = self.validate_order(
+                    trade.order,
+                    self.prices[trade.contract.symbol])
+                if price_or_bool:
+                    self.execute_trade(trade, price_or_bool)
 
-        def validate_order(self, order, price):
+        def validate_order(self, order: Order, price: BarData
+                           ) -> Union[bool, float]:
             funcs = {'MKT': lambda x, y: True,
                      'STP': self.validate_stop,
                      'LMT': self.validate_limit,
                      'TRAIL': self.validate_trail}
             return funcs[order.orderType](order, price)
 
-        def execute_trade(self, trade):
-            price = self.apply_slippage(self.prices[trade.contract.symbol],
-                                        self.ticks[trade.contract],
-                                        trade.order.action.upper())
+        def execute_trade(self, trade: Trade, price: float = None) -> None:
+            """
+            Execution price are passed as argument for limit, stop, stop-limit
+            orders. For market orders True is passed and price has to be read
+            from object properties.
+            """
+            if type(price) is bool:
+                price = self.prices[trade.contract.symbol].open
+            price = self.apply_slippage(
+                price,
+                self.ticks[trade.contract.symbol],
+                trade.order.action.upper())
+            log.debug(
+                f'executing trade: {trade}, price: {price}, date: {self.date}')
             executed_trade = self.fill_trade(trade,
                                              next(self.exec_id),
                                              self.date,
@@ -370,56 +466,58 @@ class Market:
             pnl, new_position = self.account.update_positions(executed_trade)
             self.account.update_cash(pnl)
             net_pnl = pnl - (2 * commission) if not new_position else 0
+            # trade events should be emitted after position is updated
+            trade.statusEvent.emit(trade)
+            trade.fillEvent.emit(trade, trade.fills[-1])
+            trade.filledEvent.emit(trade)
             self.update_commission(executed_trade, net_pnl, commission)
 
         @staticmethod
-        def apply_slippage(price, tick, action):
-            return price + tick/2 if action == 'BUY' else price - tick/2
+        def apply_slippage(price: float, tick: float, action: str) -> float:
+            return price + tick if action == 'BUY' else price - tick
+            # return price
 
         @staticmethod
-        def validate_stop(order, price):
-            if order.action.upper() == 'BUY' and order.auxPrice <= price:
-                return True
-            if order.action.upper() == 'SELL' and order.auxPrice >= price:
-                return True
+        def validate_stop(order: Order, price: BarData) -> bool:
+            price = (price.open, price.high, price.low, price.close)
+            if order.action.upper() == 'BUY' and order.auxPrice <= max(price):
+                return max(price)
+            if order.action.upper() == 'SELL' and order.auxPrice >= min(price):
+                return min(price)
 
         @staticmethod
-        def validate_limit(order, price):
-            if order.action.upper() == 'BUY' and order.lmtPrice >= price:
-                return True
-            if order.action.upper() == 'SELL' and order.lmtPrice <= price:
-                return True
+        def validate_limit(order: Order, price: BarData) -> Union[bool, float]:
+            price = (price.open, price.high, price.low, price.close)
+            if order.action.upper() == 'BUY' and order.lmtPrice <= min(price):
+                return order.lmtPrice
+            if order.action.upper() == 'SELL' and order.lmtPrice >= max(price):
+                return order.lmtPrice
+            return False
 
         @staticmethod
-        def validate_trail(order, price):
-            # set trail price on a new order (ie. with default trailStopPrice)
-            if order.trailStopPrice == 1.7976931348623157e+308:
-                if order.action.upper() == 'BUY':
-                    order.trailStopPrice = price + order.auxPrice
-                else:
-                    order.trailStopPrice = price - order.auxPrice
-                log.debug(
-                    f'Trail price for {order} set at {order.trailStopPrice}')
-
-            # check if order hit
+        def validate_trail(order: Order, price: BarData) -> Union[None, float]:
+            price = (price.open, price.high, price.low, price.close)
+            # check if BUY order hit
             if order.action.upper() == 'BUY':
-                if order.trailStopPrice <= price:
-                    return True
-                else:
-                    order.trailStopPrice = max(order.trailStopPrice,
-                                               price - order.auxPrice)
-                    return False
-
-            if order.action.upper() == 'SELL':
-                if order.trailStopPrice >= price:
-                    return True
+                if order.trailStopPrice <= max(price):
+                    return order.trailStopPrice
                 else:
                     order.trailStopPrice = min(order.trailStopPrice,
-                                               price + order.auxPrice)
+                                               min(price) + order.auxPrice)
+                    return False
+
+            # check if SELL order hit
+            if order.action.upper() == 'SELL':
+                if order.trailStopPrice >= min(price):
+                    return order.trailStopPrice
+                else:
+                    order.trailStopPrice = max(order.trailStopPrice,
+                                               max(price) - order.auxPrice)
                     return False
 
         @staticmethod
-        def fill_trade(trade, exec_id, date, price):
+        def fill_trade(trade: Trade, exec_id: int, date: pd.datetime,
+                       price: float) -> Trade:
             quantity = trade.order.totalQuantity
             execution = Execution(execId=exec_id,
                                   time=date,
@@ -441,19 +539,18 @@ class Market:
             trade.fills.append(fill)
             trade.orderStatus = OrderStatus(status='Filled',
                                             filled=quantity,
+                                            remaining=0,
                                             avgFillPrice=price,
                                             lastFillPrice=price)
             trade.log.append(TradeLogEntry(time=date,
                                            status=trade.orderStatus,
                                            message=f'Fill @{price}'))
 
-            trade.statusEvent.emit(trade)
-            trade.fillEvent.emit(trade, fill)
-            trade.filledEvent.emit(trade)
             return trade
 
         @staticmethod
-        def update_commission(trade, pnl, commission):
+        def update_commission(trade: Trade, pnl: float,
+                              commission: float) -> None:
             old_fill = trade.fills.pop()
             commission = CommissionReport(execId=old_fill.execution.execId,
                                           commission=commission,
@@ -469,9 +566,17 @@ class Market:
 
     instance = None
 
-    def __new__(cls):
+    def __new__(cls, cash=None, manager=None, reboot=False):
         if not Market.instance:
             Market.instance = Market.__Market()
+        else:
+            if manager:
+                Market.instance.manager = manager
+                Market.instance.reboot()
+            if reboot:
+                Market.instance._reboot = reboot
+            if cash:
+                Market.instance.account = Account(cash)
         return Market.instance
 
     def __getattr__(self, name):
@@ -482,16 +587,16 @@ class Market:
 
 
 class Account:
-    def __init__(self, cash):
+    def __init__(self, cash: Union[int, float]) -> None:
         self.cash = cash
         self.mtm = {}
         self.positions = {}
 
-    def update_cash(self, cash):
+    def update_cash(self, cash: Union[int, float]) -> None:
         self.cash += cash
 
     @staticmethod
-    def extract_params(trade):
+    def extract_params(trade: Trade) -> TradeParams:
         contract = trade.contract
         quantity = trade.fills[-1].execution.shares
         price = trade.fills[-1].execution.price
@@ -503,25 +608,24 @@ class Account:
         return TradeParams(contract, quantity, price, side, position,
                            avgCost)
 
-    def mark_to_market(self, prices):
+    def mark_to_market(self, prices) -> None:
         self.mtm = {}
-        log.debug(f'prices: {prices}')
         positions = [(contract.symbol, position.position, position.avgCost)
                      for contract, position in self.positions.items()]
         log.debug(f'positions: {positions}')
         for contract, position in self.positions.items():
             self.mtm[contract.symbol] = position.position * (
-                prices[contract.symbol] * int(contract.multiplier)
+                prices[contract.symbol].average * int(contract.multiplier)
                 - position.avgCost)
             log.debug(f'mtm: {contract.symbol} {self.mtm[contract.symbol]}')
 
     @property
-    def unrealizedPnL(self):
+    def unrealizedPnL(self) -> float:
         pnl = sum(self.mtm.values())
         log.debug(f'UnrealizedPnL: {pnl}')
         return pnl
 
-    def update_positions(self, trade):
+    def update_positions(self, trade: Trade) -> Tuple[float, bool]:
         log.debug(f'Account updating positions by trade: {trade}')
         params = self.extract_params(trade)
         if trade.contract in self.positions:
@@ -533,7 +637,7 @@ class Account:
             new = True
         return (pnl, new)
 
-    def update_existing_position(self, params):
+    def update_existing_position(self, params: TradeParams) -> float:
         old_position = self.positions[params.contract]
         # quantities are signed avgCost is not
         # avgCost is a notional of one contract
@@ -575,7 +679,7 @@ class Account:
         log.debug(f'updating cash by: {pnl}')
         return pnl
 
-    def open_new_position(self, params):
+    def open_new_position(self, params: TradeParams) -> None:
         position = Position(
             account='',
             contract=params.contract,
@@ -586,7 +690,7 @@ class Account:
 
 
 class TradeParams(NamedTuple):
-    contract: Contract
+    contract: Type[Contract]
     quantity: int
     price: float
     side: str

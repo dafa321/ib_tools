@@ -1,9 +1,9 @@
+from __future__ import annotations
+
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import List, Tuple, Union
-from datetime import datetime
+from functools import partial
+from typing import List, Type
 from abc import ABC, abstractmethod
-import csv
 
 
 import pandas as pd
@@ -11,11 +11,14 @@ import numpy as np
 
 from eventkit import Event
 from ib_insync import util, Order, MarketOrder, StopOrder, IB
-from ib_insync.order import OrderStatus
+from ib_insync.objects import Fill, CommissionReport
+from ib_insync.order import Trade
 from ib_insync.contract import ContFuture, Future
-
 from logbook import Logger
+
 from indicators import get_ATR, get_signals
+from objects import Params
+from blotter import Blotter
 
 
 log = Logger(__name__)
@@ -144,11 +147,14 @@ class ResampledStreamer(StreamAggregator):
 
 class Candle():
 
-    def __init__(self, params, streamer, trader, portfolio, ib, keep_ref=True):
+    def __init__(self, params: Params, streamer: Type[BarStreamer],
+                 trader: Type[Trader], portfolio: Type[Portfolio],
+                 ib: Type[IB], freeze_path: str, keep_ref: bool = True):
         self.__dict__.update(params.__dict__)
         self.params = params
         self.ib = ib
         self.portfolio = portfolio
+        self.path = freeze_path
         log.debug(f'candle init for contract {self.contract.localSymbol}')
         self.candles = []
         self.params.details = self.get_details()
@@ -169,7 +175,7 @@ class Candle():
 
     def freeze(self):
         self.df.to_pickle(
-            f'notebooks/freeze/freeze_df_{self.contract.localSymbol}.pickle')
+            f'{self.path}/freeze_df_{self.contract.localSymbol}.pickle')
         log.debug(f'freezed data saved for {self.contract.localSymbol}')
 
     def get_details(self):
@@ -233,26 +239,30 @@ class Candle():
 
 class Manager:
 
-    def __init__(self, ib, contracts, streamer, leverage, blotter=None,
-                 trailing=True):
+    def __init__(self, ib: IB, contracts: List[Params],
+                 streamer: BarStreamer, leverage: int,
+                 blotter: Blotter = None, trailing: bool = True,
+                 freeze_path: str = 'notebooks/freeze/live'):
         if blotter is None:
             blotter = Blotter()
         self.ib = ib
         self.contracts = contracts
         self.streamer = streamer
         self.portfolio = Portfolio(ib, leverage)
+        self.path = freeze_path
         self.trader = Trader(ib, self.portfolio, blotter, trailing)
         alloc = round(sum([c.alloc for c in contracts]), 5)
         assert alloc == 1, "Portfolio allocations don't add-up to 1"
-        log.debug('manager initiated')
+        log.debug(f'manager object initiated: {self}')
 
     def onConnected(self):
         self.trader.reconcile_stops()
         contracts = get_contracts(self.contracts, self.ib)
         log.debug(f'initializing candles')
         self.candles = [Candle(contract, self.streamer, self.trader,
-                               self.portfolio, self.ib)
+                               self.portfolio, self.ib, self.path)
                         for contract in contracts]
+        log.debug(f'onConnected run, candles: {self.candles}')
 
     def freeze(self):
         for candle in self.candles:
@@ -288,7 +298,7 @@ class Portfolio:
 
     def number_of_contracts(self, params, price):
         # self.account_value
-        return int((100000 * self.leverage *
+        return int((1e+5 * self.leverage *
                     params.alloc) / (float(params.contract.multiplier) *
                                      price))
 
@@ -304,15 +314,15 @@ class Trader:
         self.contracts = {}
         log.debug('Trader initialized')
 
-    def onEntry(self, contract, signal, atr, amount):
+    def onEntry(self, contract, signal, atr, amount) -> None:
         log.debug(
             f'entry signal handled for: {contract.localSymbol} {signal} {atr}')
         self.atr_dict[contract.symbol] = atr
         trade = self.trade(contract, signal, amount)
         trade.filledEvent += self.attach_sl
-        log.debug('entry order placed')
+        self.attach_events(trade, 'ENTRY')
 
-    def onClose(self, contract, signal):
+    def onClose(self, contract, signal) -> None:
         message = (f'close signal handled for: {contract.localSymbol}'
                    f' signal: {signal}')
         log.debug(message)
@@ -322,23 +332,17 @@ class Trader:
             if contract in self.portfolio.positions:
                 trade = self.trade(contract, signal,
                                    abs(self.portfolio.positions[contract]))
-                trade.filledEvent += self.report_close
-                log.debug('closing order placed')
+                self.attach_events(trade, 'CLOSE')
 
-    def trade(self, contract, signal, amount):
-        if signal == 1:
-            log.debug(
-                f'entering buy order for {amount} {contract.localSymbol}')
-            order = MarketOrder('BUY', amount)
-        elif signal == -1:
-            log.debug(
-                f'entering sell order for {amount} {contract.localSymbol}')
-            order = MarketOrder('SELL', amount)
-        trade = self.ib.placeOrder(contract, order)
-        return trade
+    def trade(self, contract, signal, amount) -> Trade:
+        direction = {1: 'BUY', -1: 'SELL'}
+        order = MarketOrder(direction[signal], amount)
+        message = (f'entering {direction[signal]} order for {amount} '
+                   f'{contract.localSymbol}')
+        log.debug(message)
+        return self.ib.placeOrder(contract, order)
 
-    def attach_sl(self, trade):
-        self.blotter.log_trade(trade, 'entry')
+    def attach_sl(self, trade: Trade) -> None:
         contract = trade.contract
         action = trade.order.action
         assert action in ('BUY', 'SELL')
@@ -346,8 +350,6 @@ class Trader:
         direction = 1 if reverseAction == 'BUY' else -1
         amount = trade.orderStatus.filled
         price = trade.orderStatus.avgFillPrice
-        log.info(
-            f'TRADE EXECUTED: {contract.localSymbol} {action} {amount} @{price}')
         sl_points = self.atr_dict[contract.symbol]
         if not self.trailing:
             sl_price = self.round_tick(
@@ -367,16 +369,9 @@ class Trader:
                           outsideRth=True, tif='GTC')
         trade = self.ib.placeOrder(contract, order)
         log.debug(f'stop loss attached for {trade.contract.localSymbol}')
-        self.attach_events(trade)
+        self.attach_events(trade, 'STOP-LOSS')
 
-    def attach_events(self, trade):
-        trade.filledEvent += self.report_stopout
-        trade.cancelledEvent += self.report_cancel
-        log.debug(f'Reporting events attached for {trade.contract.localSymbol} '
-                  f'{trade.order.action} {trade.order.totalQuantity} '
-                  f'{trade.order.orderType}')
-
-    def remove_sl(self, contract):
+    def remove_sl(self, contract) -> None:
         open_trades = self.ib.openTrades()
         orders = defaultdict(list)
         for t in open_trades:
@@ -386,7 +381,7 @@ class Trader:
                 self.ib.cancelOrder(order)
                 log.debug(f'stop loss removed for {contract.localSymbol}')
 
-    def reconcile_stops(self):
+    def reconcile_stops(self) -> None:
         """
         To be executed on restart. For all existing stop-outs attach reporting
         events for the blotter.
@@ -398,130 +393,49 @@ class Trader:
         for trade in trades:
             if trade.order.orderType in ('STP', 'TRAIL'
                                          ) and trade.orderStatus.remaining != 0:
-                self.attach_events(trade)
+                self.attach_events(trade, 'STOP-LOSS')
 
     @staticmethod
-    def round_tick(price, tick_size):
+    def round_tick(price: float, tick_size: float) -> float:
         floor = price // tick_size
         remainder = price % tick_size
-        if remainder > .5:
+        if remainder > (tick_size / 2):
             floor += 1
-        return floor * tick_size
+        return round(floor * tick_size, 4)
 
-    def register(self, params, symbol):
+    def register(self, params: Params, symbol: str):
         self.contracts[symbol] = params
 
-    def report_stopout(self, trade):
-        message = (f'STOP-OUT for {trade.contract.localSymbol} '
-                   f'{trade.order.action} @{trade.orderStatus.avgFillPrice}')
+    def attach_events(self, trade: Trade, reason: str) -> None:
+        report_trade = partial(self.report_trade, reason)
+        report_commission = partial(self.report_commission, reason)
+        trade.filledEvent += report_trade
+        trade.cancelledEvent += self.report_cancel
+        trade.commissionReportEvent += report_commission
+        log.debug(f'Reporting events attached for {trade.contract.localSymbol} '
+                  f'{trade.order.action} {trade.order.totalQuantity} '
+                  f'{trade.order.orderType}')
+
+    def report_trade(self, reason: str, trade: Trade) -> None:
+        message = (f'{reason} trade filled: {trade.contract.localSymbol} '
+                   f'{trade.order.action} {trade.orderStatus.filled}'
+                   f'@{trade.orderStatus.avgFillPrice}')
         log.info(message)
-        self.blotter.log_trade(trade, 'stop-out')
 
-    def report_cancel(self, trade):
-        log.info(f'Stop loss order for {trade.contract.localSymbol} cancelled')
-
-    def report_close(self, trade):
-        message = (f'CLOSE for {trade.contract.localSymbol} '
-                   f'{trade.order.action} @{trade.orderStatus.avgFillPrice}')
+    def report_cancel(self, trade: Trade) -> None:
+        message = (f'{trade.order.orderType} order {trade.order.action} '
+                   f'{trade.orderStatus.remaining} (of '
+                   f'{trade.order.totalQuantity}) for '
+                   f'{trade.contract.localSymbol} cancelled')
         log.info(message)
-        self.blotter.log_trade(trade, 'close')
+
+    def report_commission(self, reason: str, trade: Trade, fill: Fill,
+                          report: CommissionReport) -> None:
+        log.info(f'sending commission report {report}')
+        self.blotter.log_commission(trade, fill, report, reason)
 
 
-class Blotter:
-    def __init__(self, save_to_file=True, filename=None, path='blotter', note=''):
-        if filename is None:
-            filename = __file__.split('/')[-1][:-3]
-        self.file = (f'{path}/{filename}_'
-                     f'{datetime.today().strftime("%Y-%m-%d_%H-%M")}{note}.csv')
-        self.save_to_file = save_to_file
-        self.fieldnames = ['sys_time', 'time', 'contract', 'action', 'amount',
-                           'price', 'exec_ids', 'order_id', 'reason',
-                           'commission', 'realizedPNL', 'reports']
-        self.unsaved_trades = {}
-        self.blotter = []
-        if self.save_to_file:
-            self.create_header()
-
-    def create_header(self):
-        with open(self.file, 'w') as f:
-            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
-            writer.writeheader()
-
-    def log_trade(self, trade, reason=''):
-        log.debug(f'logging trade: {trade}, reason: {reason}')
-        sys_time = str(datetime.now())
-        time = trade.log[-1].time
-        contract = trade.contract.localSymbol
-        action = trade.order.action
-        amount = trade.orderStatus.filled
-        price = trade.orderStatus.avgFillPrice
-        exec_ids = [fill.execution.execId for fill in trade.fills]
-        order_id = trade.order.orderId
-        reason = reason
-        row = {'sys_time': sys_time,
-               'time': time,
-               'contract': contract,
-               'action': action,
-               'amount': amount,
-               'price': price,
-               'exec_ids': exec_ids,
-               'order_id': order_id,
-               'reason': reason,
-               'commission': 0,
-               'realizedPNL': 0,
-               'reports': 0}
-        self.unsaved_trades[order_id] = row
-        trade.commissionReportEvent += self.update_commission
-
-    def update_commission(self, trade, fill, report):
-        log.debug(
-            f'updating commission for trade: {trade}, fill: {fill}, report: {report}')
-        # commission report might be for partial fill
-        try:
-            report = self.unsaved_trades[trade.order.orderId]
-        except KeyError:
-            log.error('Failed to update commission for trade: {trade}')
-
-        report['commission'] += fill.commissionReport.commission
-        report['realizedPNL'] += fill.commissionReport.realizedPNL
-        report['reports'] += 1
-
-        if report['reports'] == len(report['exec_ids']):
-            if self.save_to_file:
-                self.write_to_file(self.unsaved_trades[trade.order.orderId])
-            else:
-                self.blotter.append(self.unsaved_trades[trade.order.orderId])
-
-            del self.unsaved_trades[trade.order.orderId]
-            log.debug(f'unsaved trades: {self.unsaved_trades}')
-
-    def write_to_file(self, data):
-        with open(self.file, 'a') as f:
-            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
-            writer.writerow(data)
-
-    def save(self):
-        self.create_header()
-        with open(self.file, 'a') as f:
-            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
-            for item in self.blotter:
-                writer.writerow(item)
-
-
-@dataclass
-class Params:
-    contract: Tuple[str]  # contract given as tuple of params given to Future()
-    periods: List[int]  # periods for breakout calculation
-    ema_fast: int  # number of periods for moving average filter
-    ema_slow: int  # number of periods for moving average filter
-    sl_atr: int  # stop loss in ATRs
-    atr_periods: int  # number of periods to calculate ATR on
-    alloc: float  # fraction of capital to be allocated to instrument
-    avg_periods: int = None  # candle volume to be calculated as average of x periods
-    volume: int = None  # candle volume given directly
-
-
-def get_contracts(params: Params, ib: IB):
+def get_contracts(params: List[Params], ib: IB) -> List[Params]:
 
     def convert(contract_tuples: List[tuple]):
         cont_contracts = [ContFuture(*contract)
